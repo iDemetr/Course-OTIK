@@ -1,0 +1,610 @@
+
+from heapq import heappush, heappop
+from typing import Dict, Tuple
+from collections import Counter
+
+from utils import *
+
+"""Канонический кодек Хаффмана.
+
+Поддерживает:
+    - построение длины кодов для каждого символа по частотам
+    - генерацию канонических кодов (canonical Huffman codes)
+    - кодирование произвольного массива байтов
+    - декодирование по переданной таблице длин
+
+Атрибуты:
+    freqs (Dict[int,int]): Частоты символов во входном будущем.
+    lengths (Dict[int,int]): Длины кодов Хаффмана.
+    canonical_codes (Dict[int, Tuple[int, int]]): Канонические коды (код, длина).
+
+API:
+    - Huffman(): класс с методами pack/unpack.
+"""
+
+class Huffman:
+# -------------------------------------------------------------------------------------------------        
+    
+    def __init__(self):
+        """Инициализирует локальные СД
+        """        
+        self.freqs: dict = dict()
+        self.lengths : dict = dict()
+        self.canonical_codes: dict[int, tuple[int,int]] = dict()
+
+# -------------------------------------------------------------------------------------------------   
+
+    def pack(self, data: bytes) -> tuple[bytes, bytes, int, int]:
+        """Кодирует массив байтов с помощью канонического Хаффмана.
+
+        Args:
+            data (bytes): Входные данные.
+
+        Returns:
+            Tuple:
+                lengths_bytes (bytes): Сериализованные длины кодов (256 байт).
+                packed (bytes): Кодированные данные.
+                padding (int): Всегда 0 (оставлено для совместимости).
+                total_bits (int): Количество значимых бит в packed.
+        """
+        
+        self.freqs = Counter(data)
+        
+        self._build_huffman_lengths()
+        self._canonical_codes_from_lengths()
+        
+        lengths_bytes = lengths_to_bytes(self.lengths)
+        
+        packed, total_bits = self._encode_bytes(data)
+        # For header we still need padding value (bits in last info-block) set to 0 since no Hamming
+        return lengths_bytes, packed, 0, total_bits
+    
+    def unpack(self, data_bytes: bytes, lengths_bytes: bytes, total_bits: int) -> bytes:
+        """Декодирует байты, закодированные каноническим кодом Хаффмана.
+
+        Args:
+            data_bytes (bytes): Поток с закодированными значениями.
+            lengths_bytes (bytes): Таблица длин кодов (256 байт).
+            total_bits (int): Число значимых бит.
+
+        Returns:
+            bytes: Декодированные исходные данные.
+        """
+
+        self.lengths = lengths_from_bytes(lengths_bytes)
+        self._canonical_codes_from_lengths()
+        
+        decode_table = self._build_decode_table_from_canonical()
+        encoded_bits = bytes_to_bits(data_bytes)
+        
+        decoded_data = self._decode_bits_with_table(encoded_bits, decode_table, total_bits)
+        return decoded_data
+
+# -------------------------------------------------------------------------------------------------        
+
+    def _build_huffman_lengths(self):
+        """Строит классическое дерево Хаффмана и вычисляет длины кодов для всех символов.
+
+        Использует минимальную кучу для построения дерева.  
+        Символы, отсутствующие во входных данных, не включаются.
+        """
+
+        # Входной файл пуст
+        if not self.freqs:
+            return {}
+
+        # Входной файл состоит из одного символа
+        if len(self.freqs) == 1:
+            sym, _ = self.freqs.popitem()
+            return {sym:1} 
+
+        # Формирование стека
+        # элемент кучи — это узел дерева Хаффмана вида
+        # (вес, уникальный_счётчик, символ_или_поддерево)
+        heap = []
+        uniq_id = 0
+
+        for sym, w in self.freqs.items():
+            heappush(heap, (w, uniq_id, sym))
+            uniq_id += 1
+
+        while len(heap) > 1:  # Построение классического дерева по Хаффману
+            w1, _, n1 = heappop(heap)
+            w2, _, n2 = heappop(heap)
+                    
+            heappush(heap, (w1 + w2, uniq_id, (n1, n2)))
+            uniq_id += 1
+    
+        _, _, root = heap[0]
+
+        def dfs(node, depth):
+            '''Обход дерева в глубину'''
+            if isinstance(node, int):   # если достингут лист дерева - базовый случай
+                self.lengths[node] = depth
+            else:                       # рекурсивный случай
+                left, right = node
+                dfs(left, depth + 1)
+                dfs(right, depth + 1)
+
+        dfs(root, 0)  # Каждый символ получает длину кода равный его глубине в дереве
+    
+    def _canonical_codes_from_lengths(self):
+        """Генерирует канонические коды Хаффмана по таблице длин.
+
+        Канонический код Хаффмана:
+            - сортирует символы по (длина, символ)
+            - на каждом уровне длины кодов ведётся счётчик
+            - коды упорядочены лексикографически по длине и значению символа
+
+        В результате получается компактное и предсказуемое отображение:
+            symbol → (code, length)
+        """
+
+        # Переупаковка в {длина, символ}
+        pairs = [(l, sym) for sym, l in self.lengths.items() if l > 0]
+        if not pairs:
+            return {}
+
+        # Сортировка по возрастанию длины, а при равенстве — по значению символа
+        pairs.sort(key=lambda x: (x[0], x[1]))
+        maxbits = pairs[-1][0]
+
+        # Подсчет кол-ва символов каждой длины
+        chars_on_layers = [0] * (maxbits + 1)
+        for l, _ in pairs:
+            chars_on_layers[l] += 1
+
+        # Генерация первого кода каждой длины
+        code = 0
+        all_codes_on_layers = {}
+        
+        # Проход в глубницу дерева по слоям для формирования уникальных кодов
+        for layer in range(1, maxbits + 1):
+            code = (code + chars_on_layers[layer - 1]) << 1
+            all_codes_on_layers[layer] = code   # Сохранение стартового номера на слое
+            # print(code)
+
+        # Присвоение кодов символам
+        for l, sym in pairs:
+            code = all_codes_on_layers[l]
+            self.canonical_codes[sym] = (code, l)
+            all_codes_on_layers[l] += 1
+
+# -------------------------------------------------------------------------------------------------
+
+    def _encode_bytes(self, data: bytes) -> Tuple[bytes, int]:
+        """Кодирует массив байтов, заменяя каждый символ его битовым кодом.
+
+        Args:
+           data (bytes): Входные данные.
+
+        Returns:
+            Tuple:
+                bytes: Упакованные данные.
+                int: Количество значимых битов.
+        """
+
+        bitbuf = []
+        for b in data:
+            new_code, l = self.canonical_codes[b]
+            byte_to_bits(bitbuf, new_code, l)
+
+        # собираем из бит байты, заполняя старшие биты первыми
+        out = bytearray((len(bitbuf)+7)//8) # буфер с целым числом байт в большую сторону
+        for i, bit in enumerate(bitbuf):
+            byte_id = i // 8        # счетчик байтов
+            bit_id = 7 - (i % 8)    # счетчик битов
+            if bit:
+                out[byte_id] |= (1 << bit_id)
+
+        return bytes(out), len(bitbuf)
+
+# -------------------------------------------------------------------------------------------------
+
+    def _build_decode_table_from_canonical(self) -> Dict[int, Dict[int, int]]:
+        """Создаёт таблицу для быстрого декодирования канонических кодов.
+
+        Таблица строится в формате:
+            length → {code → symbol}
+            
+        Returns:
+            Dict[int, Dict[int, int]]: Cловарь таблицы декодирования {длина_кода: {битовый_код: символ}}
+        
+        Пример:
+            Вход: {65: (0b00, 2), 66: (0b01, 2), 67: (0b110, 3)}
+            Выход: {2: {0: 65, 1: 66}, 3: {6: 67}}
+        """
+        
+        # Создаем пустую таблицу декодирования
+        table = {}
+
+        # Проходим по всем символам и их кодам
+        for sym, (code, code_length) in self.canonical_codes.items():
+            # Для каждой длины кода создаем подтаблицу, если её еще нет
+            # setdefault(l, {}) возвращает словарь для длины l, создает пустой если нет
+            subtable_for_length = table.setdefault(code_length, {})
+
+            # Добавляем в подтаблицу соответствие: битовый_код -> символ
+            subtable_for_length[code] = sym
+
+        return table
+
+    def _decode_bits_with_table(self, encoded_bits, decode_table_by_length, total_bits: int):
+        """Декодирование битового потока по таблице по длине.
+
+        Args:
+            encoded_bits:
+            decode_table_by_length: dict length -> dict(code_bits -> symbol)
+            total_bits: количество декодируемых бит
+            
+        Returns:
+            byteArray: раскодированный массив байт
+        """
+        out = bytearray()
+        cur = 0
+        cur_len = 0
+
+        bits_consumed = 0
+        
+        for bit in encoded_bits:        
+            cur = (cur << 1) | bit
+            cur_len += 1
+            bits_consumed += 1
+            
+            if bits_consumed > total_bits:
+                break
+            
+            table = decode_table_by_length.get(cur_len, None)
+            if table and cur in table:
+                out.append(table[cur])
+                cur = 0
+                cur_len = 0
+                
+        return bytes(out)
+
+
+
+from typing import List, Tuple
+from utils import *
+
+"""Реализация систематического кода Хэмминга для произвольного параметра r.
+
+Код Хэмминга исправляет одиночные ошибки и обнаруживает некоторые двойные.
+Используется классическая схема:
+    - Длина кодового слова: n = 2^r – 1
+    - Количество информационных битов: k = n – r
+    - Контрольные биты находятся в позициях степеней двойки (1,2,4,8,...).
+
+Атрибуты:
+    r (int): Количество проверочных битов.
+    n (int): Длина кодового слова.
+    k (int): Количество информационных бит соответственно.
+    control_bits (List[int]): Позиции проверочных битов.
+    col (Dict[int,int]): Синдромы для всех позиций кодового слова.
+    syndrome2pos (Dict[int,int]): Отображение синдром → позиция ошибки.
+
+
+API:
+    - Hamming(r): класс с методами pack/unpack.
+"""
+
+class Hamming:
+# -------------------------------------------------------------------------------------------------        
+
+    def __init__(self, r: int):
+        """Создаёт кодер/декодер Хэмминга с параметром r
+
+        Args:
+            r (int): Количество контрольных бит. Должно быть >= 2.
+
+        Raises:
+            ValueError: Если r < 2.
+        """        
+        
+        if r < 2:
+            raise ValueError("r must be >=2")
+
+        self.r = r
+        self.n = (1 << r) - 1
+        self.k = self.n - r
+
+        self.calc_syndrome()
+        
+# -------------------------------------------------------------------------------------------------   
+
+    def pack(self, data: bytes) -> tuple[bytes, int]:
+        """Упаковывает поток байт с помощью кода Хэмминга.
+
+        Последовательность действий:
+            1. Преобразуем входные байты в битовый массив.
+            2. Разбиваем поток на блоки по k бит.
+            3. Каждый блок кодируется в n бит.
+            4. В конце добавляется padding, если поток не кратен k.
+
+        Args:
+            data (bytes): Данные для кодирования.
+
+        Returns:
+            Tuple[bytes, int]:
+                encoded_data (bytes): Закодированные байты.
+                padding (int): Количество добитых нулевых бит в конце.
+        """      
+        
+        bits = bytes_to_bits(data)
+        
+        # Нарезка искодного массива данных на блоки размером k
+        padding = (self.k - (len(bits) % self.k)) % self.k
+        if padding:
+            bits += [0]*padding
+            
+        encoded_blocks = []
+        for i in range(0, len(bits), self.k):
+            block = bits[i:i+self.k]
+            encoded_blocks += self.encode_block(block)
+                    
+        encoded_data = bits_to_bytes(encoded_blocks)
+        return encoded_data, padding
+    
+    def unpack(self, data: bytes, padding: int):
+        """Декодирует поток байт, закодированный Хэммингом.
+
+        Args:
+            data (bytes): Закодированные данные.
+            padding (int): Количество добитых нулевых бит, добавленных при pack().
+
+        Returns:
+            Tuple[bytes, int, int]:
+                decoded_data (bytes): Раскодированные байты.
+                corrected (int): Число исправленных одиночных ошибок.
+                uncorrectable (int): Число блоков с необнаружимыми ошибками.
+        """     
+        
+        bits = bytes_to_bits(data)
+        
+        # process n-bit codewords
+        if len(bits) % self.n != 0:
+            # allow trailing zeros
+            pass
+        
+        info_bits = []
+        corrected = 0
+        uncorrectable = 0
+        for i in range(0, len(bits), self.n):
+            block = bits[i:i+self.n]
+            
+            if len(block) < self.n:
+                break
+            
+            data_block, was_corrected, pos, uncorrect = self.decode_block(block)
+            info_bits += data_block
+            
+            if was_corrected:
+                corrected += 1
+            if uncorrect:
+                uncorrectable += 1
+                
+        # trim padding
+        if padding:
+            info_bits = info_bits[: -padding]
+            
+        decoded_data = bits_to_bytes(info_bits)
+        return decoded_data, corrected, uncorrectable
+
+# -------------------------------------------------------------------------------------------------     
+
+    def calc_syndrome(self):
+        """Предварительно вычисляет синдромы для всех позиций кода.
+
+        Используется классическая формула: позиция кодового слова p представляется в двоичном
+        виде, и эта двоичная маска определяет влияние бита на каждый контрольный бит.
+
+        Создаёт:
+            - col[p] = синдром позиции p
+            - syndrome2pos[s] = позиция, где ошибка вызывает синдром s
+        """
+        
+        # parity positions: pow(r) (1-based)
+        self.control_bits = [1 << i for i in range(self.r)]    # 0,1,4 ...
+        
+        # постройте H столбцов матрицы (векторов синдрома) для позиций 1..n (на основе 1)
+        # каждый столбец представляет собой r-разрядное целое число, где бит i - это четность для control_bits[i]
+        self.col = {}
+        
+        # цикл по информационным битам
+        for pos in range(1, self.n + 1):
+            v = 0
+            # цикл по контрольным битам            
+            for i in range(self.r):
+                if ((pos >> i) & 1):    # "бинарный поиск"
+                    v |= (1 << i)       # установка флагов подконтроля битов
+                    
+            self.col[pos] = v
+            
+        # map syndrome -> position (if nonzero)
+        self.syndrome2pos = {v: pos for pos, v in self.col.items() if v != 0}   
+
+# -------------------------------------------------------------------------------------------------     
+
+    def encode_block(self, data_bits: List[int]) -> List[int]:
+        """Кодирует один блок длиной k бит в n бит.
+
+        Args:
+            data_bits (List[int]): Информационные биты (длина k).
+
+        Returns:
+            List[int]: Кодовое слово длиной n (список 0/1).
+
+        Raises:
+            ValueError: Если длина входа не равна k.
+        """     
+        if len(data_bits) != self.k:
+            raise ValueError("data_bits length must equal k")
+        
+        # Резерв кодового слова 1..n для удобного итерирования
+        codeword = [0] * (self.n + 1)
+        # Размещение бит данных в информационные биты
+        di = 0
+        for pos in range(1, self.n + 1):
+            if pos in self.control_bits:
+                continue
+            codeword[pos] = data_bits[di] & 1
+            di += 1
+            
+        # вычисление четности подконтрольных бит
+        for cb in self.control_bits:                 # 0,1,4 ...
+            parity = 0            
+            # обход подконтрольных информационных бит
+            for pos in range(1, self.n + 1):
+                if (pos & cb) != 0:
+                    parity ^= codeword[pos] # XOR для нахождения четности
+            codeword[cb] = parity  # parity chosen to make parity over set = s (so overall parity zero)
+            
+        return codeword[1:]
+            
+# -------------------------------------------------------------------------------------------------  
+
+    def decode_block(self, encoded_bits: List[int]) -> Tuple[List[int], bool, int, bool]:
+        """Декодирует кодовое слово Хэмминга длиной n бит.
+
+        Args:
+            encoded_bits (List[int]): Полученное кодовое слово.
+
+        Returns:
+            Tuple:
+                data_bits (List[int]): Информационные биты (k шт.).
+                corrected (bool): Исправлена ли одиночная ошибка.
+                corrected_pos (int): Позиция исправленного бита (1-based) или 0.
+                uncorrectable (bool): Обнаружена ли необрабатываемая ошибка (двойная).
+        """   
+
+        if len(encoded_bits) != self.n:
+            raise ValueError("recv_bits length must equal n")
+        
+        # Расширение кодового слова 1..n для удобного итерирования
+        codeword = [-1] + encoded_bits
+        
+        # Вычисление ошибки - сравнение синдромов
+        syndrom = 0
+        for cb in self.control_bits:                 # 0,1,4 ...
+            parity = 0
+            for pos in range(1, self.n + 1):
+                if (pos & cb) != 0: 
+                    parity ^= codeword[pos] # XOR для нахождения четности
+            if parity:
+                syndrom |= cb  # отметка синдрома
+                
+        # Если ошибок нет - вытягиваем информационные биты
+        if syndrom == 0:
+            data = []
+            for pos in range(1, self.n + 1):
+                if pos in self.control_bits:
+                    continue
+                data.append(codeword[pos])
+            return data, False, 0, False
+        
+        # Иначе ошибка: syndrom указывает на положение однобитовой ошибки, если в пределах 1..n
+        pos = self.syndrome2pos.get(syndrom, None)
+        is_error = pos is not None
+        # Коррекция
+        if is_error:
+            codeword[pos] ^= 1
+        
+        data = []
+        for pos2 in range(1, self.n + 1):
+            if pos2 in self.control_bits:
+                continue
+            data.append(codeword[pos2])
+        return data, is_error, pos or 0, not is_error
+
+# -------------------------------------------------------------------------------------------------  
+
+from typing import List, Dict
+
+def lengths_to_bytes(lengths: Dict[int,int]) -> bytes:
+    """Сериализует таблицу длин кодов в компактный байтовый формат.
+    Используем массив из 256 байт, где индекс = символ, значение = длина кода.
+    Длина 0 означает, что символ отсутствует в таблице.
+
+    Args:
+        lengths (Dict[int,int]): Словарь длин кодов {символ: длина_кода}
+
+    Returns:
+        bytes: Массив размера 256, где i-тый байт — длина символа i.
+
+    Пример:
+        Вход: {65: 3, 66: 4, 67: 2}
+        Выход: байты где [65]=3, [66]=4, [67]=2, остальные 0
+    """
+    # Создаем массив из 256 нулей (по одному байту на каждый возможный символ 0-255)
+    byte_array = bytearray(256)
+    # Заполняем массив: для каждого символа записываем его длину кода
+    for symbol, length in lengths.items():
+        # Ограничиваем длину 1 байтом (0-255) с помощью маски 0xFF
+        byte_array[symbol] = length & 0xFF
+    return bytes(byte_array)
+
+def lengths_from_bytes(data: bytes) -> Dict[int,int]:
+    """Десериализует таблицу длин кодов из байтового представления.
+    
+    Обратная операция к lengths_to_bytes - преобразует массив байт обратно в словарь длин кодов.
+
+    Args:
+        data (bytes): Последовательность из 256 байт.
+
+    Returns:
+        Dict[int,int]: {символ: длина кода}
+
+    Пример:
+        Вход: байты где [65]=3, [66]=4, [67]=2, остальные 0
+        Выход: {65: 3, 66: 4, 67: 2}
+    """
+    result = {}
+    # Проходим по всем 256 возможным символам (индексам 0-255)
+    for symbol_index, length_value in enumerate(data[:256]):
+        # Если длина не равна 0, значит символ присутствует в таблице
+        if length_value != 0:
+            # Добавляем в результат: символ -> длина кода
+            result[symbol_index] = length_value
+    return result
+
+def byte_to_bits(bitbuf: List[int], bits: int, length: int):
+    """Добавляет в битовый буфер двоичное представление числа фиксированной длины.
+
+    Args:
+        bitbuf (List[int]): Целевой буфер битов.
+        bits (int): Число, из которого извлекаются биты.
+        length (int): Количество записываемых бит (старшие первыми).
+    """
+    for i in range(length - 1, -1, -1):
+        bitbuf.append((bits >> i)&1)    # захват i-того бита
+
+def bits_to_bytes(bit_list: List[int]) -> bytes:
+    """Преобразует массив битов в массив байтов (big-endian внутри байта).
+
+    Args:
+        bit_list (List[int]): Список битов 0/1.
+
+    Returns:
+        bytes: Упакованные байты.
+    """
+    out = bytearray((len(bit_list)+7)//8)
+    for i, bit in enumerate(bit_list):
+        if bit:
+            byte_idx = i // 8
+            bit_idx = 7 - (i % 8)
+            out[byte_idx] |= (1 << bit_idx)
+    return bytes(out)
+
+def bytes_to_bits(b: bytes) -> List[int]:
+    """Преобразует байты в последовательность битов.
+
+    Args:
+        b (bytes): Входные данные.
+
+    Returns:
+        List[int]: Список битов (0/1).
+    """
+    bits = []
+    for byte in b:
+        byte_to_bits(bits, byte, 8)
+    return bits
