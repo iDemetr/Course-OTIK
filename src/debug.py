@@ -11,7 +11,7 @@ print(f, type(f))
 
 huffman = Huffman()
 
-lenght_bytes, encoded_data, _, total_bits = huffman.pack(f)
+lenght_bytes, encoded_data, total_bits = huffman.pack(f)
 
 # print("-"*20)
 
@@ -113,3 +113,5 @@ hamming = Hamming(4)
 
 # print(restored_data)
 # print(restored_data == f)
+
+# py src/main.py pack -i docs/test.txt -o arc/test_huff.otik --huffman --crc32

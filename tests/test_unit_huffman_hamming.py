@@ -79,10 +79,10 @@ class TestHammingInternals(unittest.TestCase):
         ham = Hamming(3)  # 7,4 код
         data_bits = [1, 0, 1, 1]  # 4 бита
 
-        encoded = ham.encode_block(data_bits)
+        encoded = ham._encode_block(data_bits)
         self.assertEqual(len(encoded), ham.n)
 
-        decoded, corrected, pos, uncorrectable = ham.decode_block(encoded)
+        decoded, corrected, pos, uncorrectable = ham._decode_block(encoded)
         self.assertEqual(decoded, data_bits)
         self.assertFalse(corrected)
         self.assertFalse(uncorrectable)

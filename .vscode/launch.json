@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "src/main.py",
             "console": "integratedTerminal",
-            "args": ["pack", "-i", "docs/chess16.pdf", "-o", "arc/chess16.otik", "--huffman", "--hamming", "--crc32"]
+            "args": ["pack", "-i", "docs/chess16.pdf", "-o", "arc/chess16_HH.otik", "--huffman", "--hamming", "--crc32"]
         },
         {
             "name": "Python Debugger: unpack main",
@@ -18,7 +18,7 @@
             "request": "launch",
             "program": "src/main.py",
             "console": "integratedTerminal",
-            "args": ["unpack", "-i", "arc/chess16.otik", "-o", "arc/"]
+            "args": ["unpack", "-i", "arc/chess16_HH.otik", "-o", "arc/"]
         },
         {
             "name": "Python Debugger: Current File with Arguments",

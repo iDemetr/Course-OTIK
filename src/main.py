@@ -1,11 +1,11 @@
 """
 CLI encoder:
 Usage example:
-  python main.py pack -i file1.bin file2.jpg -o data.arc --stats --verbose
-  python main.py unpack -i data.arc -o out/
-  python main.py info -i data.arc
-  python main.py verify -i data.arc
-  python main.py cli
+  py src/main.py pack -i file1.bin file2.jpg -o data.arc --stats --verbose
+  py src/main.py unpack -i data.arc -o out/
+  py src/main.py info -i data.arc
+  py src/main.py verify -i data.arc
+  py src/main.py cli
 
 mode: two-char string: bit0=huffman, bit1=hamming, e.g. "11" both.
 r: parameter r for Hamming (default 4 -> n=15,k=11)

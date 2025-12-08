@@ -2,13 +2,32 @@
 from typing import List, Tuple
 from utils import *
 
-"""Реализация систематического кода Хэмминга для произвольного параметра r.
+"""
+Расширенный cистематический код Хэмминга, схема Л. Бриллюэна, с добавленным битом глобальной четности (SECDED).
 
-Код Хэмминга исправляет одиночные ошибки и обнаруживает некоторые двойные.
-Используется классическая схема:
-    - Длина кодового слова: n = 2^r – 1
-    - Количество информационных битов: k = n – r
-    - Контрольные биты находятся в позициях степеней двойки (1,2,4,8,...).
+Структура кодового слова:
+    [ информационные биты | контрольные биты | глобальный бит четности ]
+
+Особенности:
+    - Классическая схема код Хэмминга
+        - Длина кодового слова: n = 2^r + 1
+        - Количество информационных битов: k = n – r
+    - Добавляется один общий проверочный бит (overall parity).
+    - Возможности:
+        * Исправление 1 ошибки.
+        * Обнаружение всех двойных ошибок.
+        * Отличение ошибки в основном коде от ошибки в общем бите.
+
+При декодировании появляются четыре случая:
+| Синдром | Глобальная чётность | Значение                                        |
+| ------- | ------------------- | ----------------------------------------------- |
+| 0       | 0                   | Нет ошибок                                      |
+| ≠0      | 1                   | Одиночная ошибка даннных → исправляется         |
+| ≠0      | 0                   | Ошибка в самом общем бите → исправляется        |
+| 0       | 1                   | ДВОЙНАЯ ошибка → обнаружена, но не исправляется |
+
+Структура кодового слова:
+    [ информационные биты ] + [ контрольные биты ] + [ общий бит четности ]
 
 Атрибуты:
     r (int): Количество проверочных битов.
@@ -18,9 +37,9 @@ from utils import *
     col (Dict[int,int]): Синдромы для всех позиций кодового слова.
     syndrome2pos (Dict[int,int]): Отображение синдром → позиция ошибки.
 
-
 API:
-    - Hamming(r): класс с методами pack/unpack.
+    Hamming(r).pack(data) → (encoded_bytes, padding)
+    Hamming(r).unpack(encoded, padding) → (decoded_bytes, corrected, uncorrectable)
 """
 
 class Hamming:
@@ -40,10 +59,12 @@ class Hamming:
             raise ValueError("r must be >=2")
 
         self.r = r
-        self.n = (1 << r) - 1
-        self.k = self.n - r
-
-        self.calc_syndrome()
+        self.n = (1 << r)
+        self.k = self.n - r - 1 
+        
+        # Формируем матрицу H для систематического кода: [P^T | I_r | g]
+        # g — столбец глобальной четности (все единицы)
+        self.H = self._build_parity_matrix()
         
 # -------------------------------------------------------------------------------------------------   
 
@@ -75,7 +96,7 @@ class Hamming:
         encoded_blocks = []
         for i in range(0, len(bits), self.k):
             block = bits[i:i+self.k]
-            encoded_blocks += self.encode_block(block)
+            encoded_blocks += self._encode_block(block)
                     
         encoded_data = bits_to_bytes(encoded_blocks)
         return encoded_data, padding
@@ -91,7 +112,7 @@ class Hamming:
             tuple:
             - decoded_data (bytes): Раскодированные байты.
             - corrected (int): Число исправленных одиночных ошибок.
-            - uncorrectable (int): Число блоков с необнаружимыми ошибками.
+            - uncorrectable (int): Число необрабатываемых (двойных) ошибок
         """     
         
         bits = bytes_to_bits(data)
@@ -101,66 +122,34 @@ class Hamming:
             # allow trailing zeros
             pass
         
-        info_bits = []
+        decoded_bits = []
         corrected = 0
         uncorrectable = 0
+        
         for i in range(0, len(bits), self.n):
             block = bits[i:i+self.n]
             
             if len(block) < self.n:
                 break
             
-            data_block, was_corrected, pos, uncorrect = self.decode_block(block)
-            info_bits += data_block
+            info_bits, was_corrected, pos, was_uncorrectable = self._decode_block(block)
+            decoded_bits += info_bits
             
             if was_corrected:
                 corrected += 1
-            if uncorrect:
+            if was_uncorrectable:
                 uncorrectable += 1
                 
         # trim padding
         if padding:
-            info_bits = info_bits[: -padding]
+            decoded_bits = decoded_bits[: -padding]
             
-        decoded_data = bits_to_bytes(info_bits)
+        decoded_data = bits_to_bytes(decoded_bits)
         return decoded_data, corrected, uncorrectable
 
 # -------------------------------------------------------------------------------------------------     
 
-    def calc_syndrome(self):
-        """Предварительно вычисляет синдромы для всех позиций кода.
-
-        Используется классическая формула: позиция кодового слова p представляется в двоичном
-        виде, и эта двоичная маска определяет влияние бита на каждый контрольный бит.
-
-        Создаёт:
-            - col[p] = синдром позиции p
-            - syndrome2pos[s] = позиция, где ошибка вызывает синдром s
-        """
-        
-        # parity positions: pow(r) (1-based)
-        self.control_bits = [1 << i for i in range(self.r)]    # 0,1,4 ...
-        
-        # постройте H столбцов матрицы (векторов синдрома) для позиций 1..n (на основе 1)
-        # каждый столбец представляет собой r-разрядное целое число, где бит i - это четность для control_bits[i]
-        self.col = {}
-        
-        # цикл по информационным битам
-        for pos in range(1, self.n + 1):
-            v = 0
-            # цикл по контрольным битам            
-            for i in range(self.r):
-                if ((pos >> i) & 1):    # "бинарный поиск"
-                    v |= (1 << i)       # установка флагов подконтроля битов
-                    
-            self.col[pos] = v
-            
-        # map syndrome -> position (if nonzero)
-        self.syndrome2pos = {v: pos for pos, v in self.col.items() if v != 0}   
-
-# -------------------------------------------------------------------------------------------------     
-
-    def encode_block(self, data_bits: List[int]) -> List[int]:
+    def _encode_block(self, data_bits: List[int]) -> List[int]:
         """Кодирует один блок длиной k бит в n бит.
 
         Args:
@@ -175,30 +164,12 @@ class Hamming:
         if len(data_bits) != self.k:
             raise ValueError("data_bits length must equal k")
         
-        # Резерв кодового слова 1..n для удобного итерирования
-        codeword = [0] * (self.n + 1)
-        # Размещение бит данных в информационные биты
-        di = 0
-        for pos in range(1, self.n + 1):
-            if pos in self.control_bits:
-                continue
-            codeword[pos] = data_bits[di] & 1
-            di += 1
-            
-        # вычисление четности подконтрольных бит
-        for cb in self.control_bits:                 # 0,1,4 ...
-            parity = 0            
-            # обход подконтрольных информационных бит
-            for pos in range(1, self.n + 1):
-                if (pos & cb) != 0:
-                    parity ^= codeword[pos] # XOR для нахождения четности
-            codeword[cb] = parity  # parity chosen to make parity over set = s (so overall parity zero)
-            
-        return codeword[1:]
-            
+        parity_bits, g = self._calc_parity_bits(data_bits)
+        return data_bits + parity_bits + [g]
+                    
 # -------------------------------------------------------------------------------------------------  
 
-    def decode_block(self, encoded_bits: List[int]) -> Tuple[List[int], bool, int, bool]:
+    def _decode_block(self, encoded_bits: List[int]) -> Tuple[List[int], bool, int, bool]:
         """Декодирует кодовое слово Хэмминга длиной n бит.
 
         Args:
@@ -214,41 +185,143 @@ class Hamming:
 
         if len(encoded_bits) != self.n:
             raise ValueError("recv_bits length must equal n")
-        
-        # Расширение кодового слова 1..n для удобного итерирования
-        codeword = [-1] + encoded_bits
-        
-        # Вычисление ошибки - сравнение синдромов
-        syndrom = 0
-        for cb in self.control_bits:                 # 0,1,4 ...
-            parity = 0
-            for pos in range(1, self.n + 1):
-                if (pos & cb) != 0: 
-                    parity ^= codeword[pos] # XOR для нахождения четности
-            if parity:
-                syndrom |= cb  # отметка синдрома
                 
-        # Если ошибок нет - вытягиваем информационные биты
-        if syndrom == 0:
-            data = []
-            for pos in range(1, self.n + 1):
-                if pos in self.control_bits:
-                    continue
-                data.append(codeword[pos])
-            return data, False, 0, False
-        
-        # Иначе ошибка: syndrom указывает на положение однобитовой ошибки, если в пределах 1..n
-        pos = self.syndrome2pos.get(syndrom, None)
-        is_error = pos is not None
-        # Коррекция
-        if is_error:
-            codeword[pos] ^= 1
-        
-        data = []
-        for pos2 in range(1, self.n + 1):
-            if pos2 in self.control_bits:
-                continue
-            data.append(codeword[pos2])
-        return data, is_error, pos or 0, not is_error
+        s, syndrome_val, double_error = self._check_errors_block(encoded_bits)
+            
+        # ---- Обработка ошибок ----
+        return self._handler_decoded_errors(encoded_bits, double_error, syndrome_val)
 
+# -------------------------------------------------------------------------------------------------  
+
+    def _calc_parity_bits(self, data_bits: List[int]) -> Tuple[List[int], int]:
+        """Вычисляет r контрольных бит и 1 глобальный.
+
+        Args:
+            data_bits (List[int]): _description_
+
+        Raises:
+            ValueError: _description_
+
+        Returns:
+            Tuple[List[int], int]: _description_
+        """        
+
+        if len(data_bits) != self.k:
+            raise ValueError("Expected k data bits")
+
+        # Контрольные биты
+        parity_bits = []
+        for row in self.H:
+            s = 0
+            for i in range(self.k):
+                s ^= data_bits[i] & row[i]
+            parity_bits.append(s)
+
+        # Глобальная четность по всему слову: d + p
+        global_parity = sum(data_bits) ^ sum(parity_bits)
+        global_parity &= 1
+
+        return parity_bits, global_parity
+
+    def _check_errors_block(self, encoded_bits: List[int]) -> tuple[List[int], int, bool]:
+        """Проверяет кодовое слово на ошибки при декодировании
+
+        Args:
+            encoded_bits (List[int]): Проверяемое кодовое слово
+
+        Returns:
+            tuple[List[int], int, bool]: _description_
+        """        
+        
+        # ---- синдром r бит ----
+        syndrome = []
+        for row in self.H:
+            s = 0
+            for i in range(self.n):
+                s ^= encoded_bits[i] & row[i]
+            syndrome.append(s)
+
+        syndrome_val = 0
+        for i, b in enumerate(syndrome):
+            syndrome_val |= (b << i)
+        
+        g_recv = encoded_bits[-1]
+        # ---- проверка глобальной четности ----
+        global_parity_calc = sum(encoded_bits[:-1]) & 1
+        double_error = (global_parity_calc != g_recv)
+        
+        return syndrome, syndrome_val, double_error
+    
+    def _handler_decoded_errors(self, encoded_bits: List[int], double_error: bool, syndrome_val: int) -> Tuple[List[int], bool, int, bool]:
+        """Обработчик ошибок, возникших при декодировании кодового слова
+
+        Args:
+            encoded_bits (List[int]): _description_
+            double_error (bool): _description_
+            syndrome_val (int): _description_
+
+        Returns:
+            Tuple[List[int], bool, int, bool]: _description_
+        """        
+        
+        data = encoded_bits[:self.k]
+        
+        # ---- случаи обработки ----
+        # 1) Нет ошибок: синдром 0, глобальная четность верна
+        if syndrome_val == 0 and not double_error:
+            return data, False, -1, False
+
+        # 2) Двойная ошибка: синдром != 0 и глобальная четность неверна
+        if syndrome_val != 0 and double_error:
+            return data, False, -1, True
+
+        # 3) Одиночная ошибка: синдром указывает позицию (1-based)
+        # Позиции соответствуют столбцам H: 1..n
+        if not (1 <= syndrome_val <= self.k):
+            # Неверный синдром — двойная ошибка
+            return data, False,  -1, True
+
+        # Исправляем
+        encoded_bits[syndrome_val - 1] ^= 1
+
+        # После исправления извлекаем данные
+        corrected_data = encoded_bits[:self.k]
+
+        return corrected_data, True, syndrome_val, False  
+
+    def _build_parity_matrix(self) -> List[List[int]]:
+        """
+        Строит матрицу проверок H размером r x n:
+
+              d-bits | p-bits | g
+           [   P^T   |   I_r  | 1 ]
+
+        Где:
+            P — произвольная матрица, удовлетворяющая 2^r >= k + r + 1.
+            В данной реализации P строится как столбцы бинарных номеров.
+
+        Возвращает матрицу H: список строк, каждая строка — r-я проверка.
+        """
+
+        H = []
+
+        # Строим r строк
+        for parity_row in range(self.r):
+            row = []
+
+            # Информационные биты: бинарный номер позиции
+            for pos in range(1, self.k + 1):
+                row.append((pos >> parity_row) & 1)
+
+            # Контрольные биты: единичная диагональ
+            for i in range(self.r):
+                row.append(1 if i == parity_row else 0)
+
+            # Глобальная четность: всегда 1
+            row.append(1)
+
+            H.append(row)
+
+        return H
+    
 # -------------------------------------------------------------------------------------------------  

@@ -14,6 +14,10 @@ import Archive_Formats as otik
 
 # =================================================================================================================
 
+_MAX_FILES = 1000
+
+# =================================================================================================================
+
 def _align_up(value: int, align: int) -> int:
     return ((value + align - 1) // align) * align
 
@@ -51,7 +55,10 @@ class ArchiveWriter:
         
         if len(self._entries) > 1:
             raise NotImplementedError("Поддержа более 1 файла в архиве не поддерживается!")
-        
+                        
+        if len(self._entries) > _MAX_FILES:
+            raise RuntimeError(f"Превышен лимит максимального кол-ва архивируемых файлов. Максимум: {_MAX_FILES}")
+                
         entry = HeaderFile(
             name            = name,
             lengths_codes   = meta_data["lengths_codes"],
@@ -71,20 +78,14 @@ class ArchiveWriter:
 
     def finalize(self) -> None:
         """
-        Собирает DataTable + DataSection и записывает весь архив атомарно.
-        Алгоритм:
-         - сформировать File headers (заполнить все поля, кроме DataOffset для файлов с данными)
-         - вычислить длину DataTable (с учётом выравнивания записей на 8 байт)
-         - назначить DataSectionOffset = _OFF_DATATABLE + datatable_len
-         - последовательно записать DataSection (только для файлов с CompressedSize > 0), запомнить offsets
-         - заполнить DataOffset в File headers
-         - вычислить DataCrc32 по всем байтам DataSection (в том порядке, как записаны)
-         - заполнить остальные поля заголовка (ArchiveSize, DataCrc32, FileCount, DataSectionOffset)
-         - вычислить HeaderCrc32 (с HeaderCrc32==0) и записать файл
+        Собирает Archive Header + DataTable + DataSection и записывает весь архив атомарно.
         """
         
         if self.header is None:
             raise RuntimeError("Header not initialized")
+        
+        if len(self._entries) > _MAX_FILES:
+            raise RuntimeError(f"Превышен лимит максимального кол-ва архивируемых файлов. Максимум: {_MAX_FILES}")
         
         if len(self.header.code_table) != CODE_TABLE_SIZE:
             raise RuntimeError("Кодовая таблица не установлена")
@@ -93,96 +94,63 @@ class ArchiveWriter:
         self.header.file_count = len(self._entries)
         prefix = otik._endian_prefix(self.header.bytes_order)
         
-        # =========================================================================
-        # STAGE 1. Первичный DataTable (без реальных data_offset)
-        # =========================================================================
+        # =============================== STAGE 1. Вычисление размера таблицы файлов ================================
         
-        datatable_blocks_first: list[bytes] = []
-        cur_offset = otik._OFF_DATATABLE  # абсолютное смещение начала DataTable
-        file_fixed_sizes: list[int] = []
-
+        datatable_size = 0
         for hdr, compressed in self._entries:
-            hdr.data_offset = 0  # пока 0
-            block = hdr.to_bytes(prefix)
-
-            datatable_blocks_first.append(block)
-            file_fixed_sizes.append(len(block))
-
             # 8-byte align — смещение к следующей записи
-            cur_offset += len(block)
-            next_aligned = _align_up(cur_offset, 8)
-            cur_offset = next_aligned
+            size = hdr.get_size()
+            hdr.total_padd = _pad_to8(size) - size
+            datatable_size += size + hdr.total_padd
 
-        datatable_size_first = cur_offset - otik._OFF_DATATABLE
-
-        # =========================================================================
-        # STAGE 2. Вычисление смещений data_offset для всех файлов
-        # =========================================================================
+        # ================================ STAGE 2. Разметка data_offset всех файлов ================================
 
         # Смещение начала DataSection
-        self.header.data_section_offset = otik._OFF_DATATABLE + datatable_size_first
-        cur_data_offset = self.header.data_section_offset
+        data_section_offset =  otik.OFF_DATATABLE + datatable_size
+        self.header.data_section_offset = data_section_offset
 
         real_data_offsets: list[int] = []
 
+        cur_data_offset = 0
         for hdr, compressed in self._entries:
             if hdr.compressed_size == 0:
                 hdr.data_offset = 0
                 real_data_offsets.append(0)
                 continue
 
-            hdr.data_offset = cur_data_offset
-            real_data_offsets.append(cur_data_offset)
-
+            hdr.data_offset = data_section_offset + cur_data_offset
+            real_data_offsets.append(cur_data_offset)            
             cur_data_offset += len(compressed)
 
-        data_section_size = cur_data_offset - self.header.data_section_offset
+        data_section_size = cur_data_offset 
 
-        # =========================================================================
-        # STAGE 3. Вторая сборка DataTable (уже с корректными data_offset)
-        # =========================================================================
+        # ================================= STAGE 3. Cборка DataTable и DataSection =================================
 
-        datatable_blocks_final: list[bytes] = []
-        cur_offset = otik._OFF_DATATABLE
+        datatable_bin = bytearray()
+        data_section_bin = bytearray()
 
-        for (hdr, compressed) in self._entries:
-            block = hdr.to_bytes(prefix)
-            datatable_blocks_final.append(block)
-            cur_offset += len(block)
-            cur_offset = _align_up(cur_offset, 8)
-
-        # =========================================================================
-        # STAGE 4. Сборка DataSection
-        # =========================================================================
-
-        data_section = bytearray()
         for hdr, compressed in self._entries:
-            if hdr.compressed_size == 0:
-                continue
-            data_section.extend(compressed)
+            header_bin = hdr.to_bytes(prefix)
+            
+            datatable_bin.extend(header_bin)
+            if hdr.total_padd  > 0:
+                datatable_bin.extend(b"\x00" * hdr.total_padd )                
+            
+            if hdr.compressed_size != 0:
+                data_section_bin.extend(compressed)
+                
+        data_section_bytes = bytes(data_section_bin)
+        datatable_bytes = bytes(datatable_bin)
 
-        data_section_bytes = bytes(data_section)
-
-        # =========================================================================
-        # STAGE 5. CRC32 по DataSection
-        # =========================================================================
+        # ====================== STAGE 4. CRC32 по DataSection и фиксация размера всего архива =======================
 
         self.header.data_crc32 = zlib.crc32(data_section_bytes) & 0xFFFFFFFF
+        self.header.archive_size = otik.OFF_DATATABLE + datatable_size + data_section_size
 
-        # =========================================================================
-        # STAGE 6. Финальная сборка Header + CodeTable с учётом header_crc32
-        # =========================================================================
-
-        # Предварительные значения
-        self.header.archive_size = (
-            otik._OFF_DATATABLE +
-            (sum(len(b) for b in datatable_blocks_final) +
-            sum(_pad_to8(len(b)) - len(b) for b in datatable_blocks_final)) +
-            len(data_section_bytes)
-        )
-
+        # ==================== STAGE 5. Финальная сборка Header с учётом header_crc32 + CodeTable ====================
+        
         # Для вычисления header_crc32 поле header_crc32 должно быть 0
-        #self.header.header_crc32 = 0
+        self.header.header_crc32 = 0                    # дубль на всякий случай
         header_blob = self.header.to_bytes()
         # CRC только по header_blob
         self.header.header_crc32 = zlib.crc32(header_blob) & 0xFFFFFFFF
@@ -190,35 +158,25 @@ class ArchiveWriter:
         # Теперь финальное дерево байтов заголовка
         header_blob = self.header.to_bytes()
 
-        # =========================================================================
-        # STAGE 7. Запись итогового архива
-        # =========================================================================
-
+        # ===================================== STAGE 6. Запись итогового архива =====================================
+        
         # Atomic write to disk
-        dir_path = os.path.dirname(self.path)
-        name = os.path.basename(self.path)
-        os.makedirs(dir_path, exist_ok=True)
+        dir_path = os.path.dirname(self.path)           # Обрезка названия файла
+        name = os.path.basename(self.path)              # Выделение названия файла
+        os.makedirs(dir_path, exist_ok=True)            # Создать директорию, если нет.
+        
         fd, tmp = tempfile.mkstemp(dir=dir_path, prefix=name+".tmp_")
         os.close(fd)
         with open(tmp, "wb") as f:
             # Header (96 bytes) with CodeTable (256 bytes)
             f.write(header_blob)
             
-            # DataTable
-            abs_pos = otik._OFF_DATATABLE
-            for block in datatable_blocks_final:
-                f.write(block)
-                abs_pos += len(block)
-                padding = _align_up(abs_pos, 8) - abs_pos
-                if padding > 0:
-                    f.write(b"\x00" * padding)
-                    abs_pos += padding
-
+            f.write(datatable_bytes)
+            
             # DataSection
             f.write(data_section_bytes)
         
         os.replace(tmp, self.path)
-        #os.remove(tmp)
 
 class ArchiveReader:
     """
@@ -235,23 +193,25 @@ class ArchiveReader:
         Выполняет проверку crc32 для заголовка и для архивированных данных
         Вызывает парсер локального репозитория - DataTable 
 
-        Raises:
-            ValueError: _description_
-
         Returns:
             ArchiveHeader: возвращает заголовок всего архива
         """        
-        metatable_size = HEADER_SIZE + CODE_TABLE_SIZE
         with open(self.path, "rb") as f:
             # read header + code_table
-            head = f.read(metatable_size)
-            if len(head) < metatable_size:
-                raise ValueError("File too small to be valid {Signature} archive")
+            head = f.read(otik.META_SIZE)
+            
+            if head[:H_SIGNATURE_SIZE] != H_SIGNATURE:
+                raise ImportError(f"File signature is differs from the archive")
+            if len(head) < otik.META_SIZE:
+                raise ImportError(f"File too small to be valid {H_SIGNATURE} archive")
             
             self.header = ArchiveHeader.from_bytes(head)
             # verify header CRC
             self.header.validate_crc32()
-                
+        
+            if self.header.file_count > _MAX_FILES:
+                raise RuntimeError(f"Превышен лимит максимального кол-ва файлов в архиве. Максимум: {_MAX_FILES}")
+                    
             # parse file table (DataTable) lazily
             self._parse_datatable(f)
         
@@ -262,24 +222,18 @@ class ArchiveReader:
 
         Args:
             f (BinaryIO): Поток чтения текучего архива
-
-        Raises:
-            RuntimeError: _description_
-            EOFError: _description_
-            ValueError: _description_
-            EOFError: _description_
         """        
         
         if self.header is None:
             raise RuntimeError("Header not loaded")
-        f.seek(otik._OFF_DATATABLE)
+        f.seek(otik.OFF_DATATABLE)
         
         lengths_codes = self.header.code_table
         prefix = otik._endian_prefix(self.header.bytes_order)
-        
+
         for i in range(self.header.file_count):
-            hdr_blob = f.read(FILE_HEADER_FIXED_SIZE)
-            if len(hdr_blob) < FILE_HEADER_FIXED_SIZE:
+            hdr_blob = f.read(FH_FIXED_SIZE)
+            if len(hdr_blob) < FH_FIXED_SIZE:
                 raise EOFError("Unexpected EOF while reading file header")
             
             name_len = otik._unpack(f"{prefix}H", hdr_blob, 28)
@@ -351,7 +305,7 @@ class ArchiveReader:
             to_read = end - start
             crc = 0
             # read in chunks
-            chunk_size = 2 << 8
+            chunk_size = 2 << 16
             
             while to_read > 0:
                 chunk = f.read(min(chunk_size, to_read))
